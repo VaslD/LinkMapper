@@ -1,4 +1,4 @@
-struct MachOSection {
+struct MachOSection: Equatable, Hashable, Sendable {
     let address: UInt
     let size: Int
     let segment: String

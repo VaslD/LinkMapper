@@ -1,4 +1,4 @@
-struct Symbol {
+struct Symbol: Equatable, Hashable, Sendable {
     let address: UInt
     let size: Int
     let object: Int

@@ -1,4 +1,4 @@
-struct DeadStrippedSymbol {
+struct DeadStrippedSymbol: Equatable, Hashable, Sendable {
     let size: Int
     let object: Int
     let name: String

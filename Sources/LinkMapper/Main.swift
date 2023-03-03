@@ -3,172 +3,115 @@ import Foundation
 import TabularData
 
 @main
-struct Main: AsyncParsableCommand {
+struct LinkMapper: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
-        abstract: "Link Map 解析和数据统计工具",
-        version: "1.1.0"
+        abstract: "Link Map Analysis",
+        version: "2.0.0"
     )
 
-    static let formatter: MeasurementFormatter = {
-        let formatter = MeasurementFormatter()
-        formatter.numberFormatter.maximumFractionDigits = 2
-        formatter.unitOptions = .naturalScale
-        return formatter
-    }()
+    @Option(name: .shortAndLong, help: "Max number of lines in summary table.")
+    var lines: Int?
 
-    @Option(name: .shortAndLong, help: "输出进度和调试信息。")
-    var verbose = false
-
-    @Option(name: .shortAndLong, help: "限制统计表格最大行数。")
-    var linesInSummary: Int?
-
-    @Option(name: .long, help: "读取指定条数符号后提前终止。仅供调试，最终统计数据无意义。")
-    var earlyExitThreshold: Int?
-
-    @Argument(help: "Link Map 文件路径。")
+    @Argument(help: "Path to link map file.")
     var filePath: String
 
     func run() async throws {
-        guard let reader = LineReader(URL(fileURLWithPath: filePath)) else {
-            print("Unreadable file: \(self.filePath)")
+        let stopwatch = ContinuousClock()
+
+        print("Reading file into memory…", terminator: " ")
+        var time = stopwatch.now
+        let data = try Data(contentsOf: URL(fileURLWithPath: self.filePath))
+        guard let string = String(data: data, encoding: .macOSRoman) else {
             throw ExitCode(EX_DATAERR)
         }
+        let lines = string.components(separatedBy: "\n")
+        print("[OK] (\((stopwatch.now - time).formatted()))")
+        print(
+            """
+            Link Map File: \(Measurement(value: Double(data.count), unit: UnitInformationStorage.bytes)
+                .formatted(.byteCount(style: .file))), \
+            \(lines.count.formatted()) lines
+            """,
+            terminator: "\n\n"
+        )
 
-        var groups = [URL: ObjectsGroup]()
-        var objects = [Int: ObjectFile]()
-        var sectionSize = 0
+        print("Building state machine…  ", terminator: " ")
+        time = stopwatch.now
+        let states = State.buildStateMachine(lines)
+        print("[OK] (\((stopwatch.now - time).formatted()))", terminator: "\n\n")
 
-        var state: State?
-        var records = 0
-        fileParser: for var line in reader {
-            if let header = line.firstMatch(of: #/^#\s+(.*):\s*(.*)$/#),
-               let next = State(rawValue: String(header.1)) {
-                state = next
-                print()
-                print("SM -> [\(next)]")
-                line = String(header.2)
+        print("Processing entries…      ", terminator: " ")
+        time = stopwatch.now
+        let graph = ObjectGraph()
+        await withTaskGroup(of: Void.self) { tasks in
+            for state in states {
+                switch state {
+                case let .path(path):
+                    graph.path = path
+
+                case let .architecture(arch):
+                    graph.architecture = arch
+
+                case let .objects(range):
+                    for line in lines[range] {
+                        tasks.addTask {
+                            guard let object = ObjectFile(line) else {
+                                return
+                            }
+                            graph.insert(object)
+                        }
+                    }
+
+                case let .sections(range):
+                    for line in lines[range] {
+                        guard !line.isEmpty else {
+                            continue
+                        }
+                        tasks.addTask {
+                            _ = MachOSection(line)
+                        }
+                    }
+
+                case let .symbols(range):
+                    for line in lines[range] {
+                        guard !line.isEmpty else {
+                            continue
+                        }
+                        tasks.addTask {
+                            let symbol = Symbol(line)
+                            graph.insert(symbol)
+                        }
+                    }
+
+                case .stripped:
+                    break
+                }
             }
 
-            guard !line.isEmpty else {
-                continue
-            }
-            guard !line.hasPrefix("#") else {
-                continue
-            }
-
-            switch state {
-            case .none:
-                continue
-
-            case .path:
-                print("Path: \(line)")
-
-            case .architecture:
-                print("Arch: \(line)")
-
-            case .objects:
-                let match = line.wholeMatch(of: #/\[\s*(\d+)\]\s+([^\(]+)(?:\(([^\)]*)\))?/#)!
-                let id = Int(match.1)!
-                let path: String
-                let name: String
-                if let object = match.3 {
-                    path = String(match.2)
-                    name = String(object)
-                } else {
-                    let fileURL = URL(fileURLWithPath: String(match.2))
-                    path = fileURL.deletingLastPathComponent().path
-                    name = fileURL.lastPathComponent
-                }
-                guard !path.hasPrefix("/Applications/Xcode"), name != "linker synthesized" else {
-                    continue
-                }
-                objects[id] = ObjectFile(path, name)
-
-            case .sections:
-                let section = MachOSection(line)
-                sectionSize += section.size
-                if self.verbose {
-                    let size = Self.formatter.string(from: Measurement(value: Double(section.size),
-                                                                       unit: UnitInformationStorage.bytes))
-                    print("MACH-O += \(size)")
-                }
-
-            case .symbols:
-                let symbol = Symbol(line)
-                guard var object = objects[symbol.object] else {
-                    continue
-                }
-                object.grow(symbol.size)
-                objects[symbol.object] = object
-                records += 1
-                if self.verbose {
-                    let size = Self.formatter.string(from: Measurement(value: Double(symbol.size),
-                                                                       unit: UnitInformationStorage.bytes))
-                    print("MACH-O += \(size)")
-                }
-                if let threshold = self.earlyExitThreshold, records > threshold {
-                    print("=> EARLY EXIT!")
-                    break fileParser
-                }
-
-            case .stripped:
-                guard self.verbose else {
-                    break fileParser
-                }
-
-                let symbol = DeadStrippedSymbol(line)
-                let size = Self.formatter.string(from: Measurement(value: Double(symbol.size),
-                                                                   unit: UnitInformationStorage.bytes))
-                print("MACH-O -= \(size)")
-            }
+            await tasks.waitForAll()
         }
-
-        print()
-        print("Generating summary...")
-
-        for (_, object) in objects {
-            var group: ObjectsGroup
-            if let item = groups[object.path] {
-                group = item
-            } else {
-                group = ObjectsGroup(object.path)
-            }
-            group.insert(object)
-            groups[object.path] = group
+        print("[OK] (\((stopwatch.now - time).formatted()))")
+        print(graph, terminator: "\n\n")
+        
+        print("Generating summary…      ", terminator: " ")
+        time = stopwatch.now
+        let summary = graph.summarize()
+        var table = DataFrame()
+        table.append(column: Column<String>(name: "Object", capacity: summary.count))
+        table.append(column: Column<Int>(name: "Size", capacity: summary.count))
+        for (key, value) in summary {
+            table.append(row: URL(filePath: key).lastPathComponent, value)
         }
-
-        var frame = DataFrame()
-        frame.append(column: Column<String>(name: "Object File", capacity: groups.count))
-        frame.append(column: Column<Int>(name: "Size", capacity: groups.count))
-
-        for (path, objects) in groups {
-            let size = objects.size
-            guard size > 0 else {
-                continue
-            }
-            frame.append(row: path.lastPathComponent, objects.size)
-            sectionSize += size
-        }
-
+        print("[OK] (\((stopwatch.now - time).formatted()))", terminator: "\n\n")
+        
         var format = FormattingOptions()
         format.integerFormatStyle = IntegerFormatStyle().grouping(.automatic).notation(.compactName)
         format.includesColumnTypes = false
-        if let lines = self.linesInSummary {
+        if let lines = self.lines {
             format.maximumRowCount = lines
         } else {
-            format.maximumRowCount = groups.count
+            format.maximumRowCount = summary.count
         }
-        print()
-        print(frame.sorted(on: "Size", order: .descending).description(options: format))
-
-        print()
-        let size = Self.formatter.string(from: Measurement(value: Double(sectionSize),
-                                                           unit: UnitInformationStorage.bytes))
-        print("Mach-O：\(size) (from \(objects.count.formatted()) objects, \(records.formatted()) symbols)")
-
-        if self.earlyExitThreshold != nil {
-            print()
-            print("\u{001B}[0;31m因为一个调试参数，Link Mapper 提前终止。")
-        }
+        print(table.sorted(on: "Size", order: .descending).description(options: format))
     }
 }
